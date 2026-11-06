@@ -1,0 +1,859 @@
+name: Build HomeCam APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project files
+        run: |
+          mkdir -p $RUNNER_TEMP/proj && cd $RUNNER_TEMP/proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'HOMECAM_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "bd.homecam"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "bd.homecam"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-video:1.3.4")
+              implementation("androidx.lifecycle:lifecycle-service:2.8.4")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          HOMECAM_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="HomeCam"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CameraService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera" />
+              </application>
+          </manifest>
+          HOMECAM_EOF
+          mkdir -p app/src/main/java/bd/homecam
+          cat > app/src/main/java/bd/homecam/CameraService.kt <<'HOMECAM_EOF'
+          package bd.homecam
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Matrix
+          import android.os.BatteryManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.util.Size
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.ImageProxy
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.video.FallbackStrategy
+          import androidx.camera.video.FileOutputOptions
+          import androidx.camera.video.Quality
+          import androidx.camera.video.QualitySelector
+          import androidx.camera.video.Recorder
+          import androidx.camera.video.Recording
+          import androidx.camera.video.VideoCapture
+          import androidx.camera.video.VideoRecordEvent
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.LifecycleService
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.ExecutorService
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class CameraService : LifecycleService() {
+
+              companion object {
+                  const val ACTION_STOP = "bd.homecam.STOP"
+                  @Volatile var running = false
+                  private const val CHANNEL = "homecam"
+                  private const val GRID_W = 80
+                  private const val GRID_H = 60
+              }
+
+              private lateinit var tg: Telegram
+              private val main = Handler(Looper.getMainLooper())
+              private val io: ExecutorService = Executors.newSingleThreadExecutor()
+              private val analyzerExec: ExecutorService = Executors.newSingleThreadExecutor()
+              private var provider: ProcessCameraProvider? = null
+              private var videoCapture: VideoCapture<Recorder>? = null
+              private var recording: Recording? = null
+              private var wakeLock: PowerManager.WakeLock? = null
+              private var poller: Thread? = null
+
+              @Volatile private var armed = true
+              @Volatile private var sens = 60
+              @Volatile private var wantPhoto = false
+              @Volatile private var lastMotion = 0L
+              @Volatile private var forceRecordUntil = 0L
+              private var lastAlert = 0L
+              private var recStart = 0L
+              private var startedAt = 0L
+              private var lastProc = 0L
+              private var hits = 0
+              private var prev: ByteArray? = null
+
+              private val powerReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      val b = batteryPercent()
+                      when (i.action) {
+                          Intent.ACTION_POWER_DISCONNECTED ->
+                              notifyText("⚡ বিদ্যুৎ চলে গেছে। ফোন এখন ব্যাটারিতে চলছে ($b%)।")
+                          Intent.ACTION_POWER_CONNECTED ->
+                              notifyText("🔌 বিদ্যুৎ ফিরে এসেছে। ব্যাটারি $b%।")
+                          Intent.ACTION_BATTERY_LOW ->
+                              notifyText("🪫 ব্যাটারি কমে গেছে ($b%)। ফোন যেকোনো সময় বন্ধ হতে পারে।")
+                      }
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  super.onStartCommand(intent, flags, startId)
+                  if (intent?.action == ACTION_STOP) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (running) return START_NOT_STICKY
+
+                  val p = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val token = p.getString("token", "") ?: ""
+                  val chat = p.getString("chat", "") ?: ""
+                  if (token.isEmpty() || chat.isEmpty()) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  tg = Telegram(token, chat)
+                  sens = p.getInt("sens", 60)
+                  armed = p.getBoolean("auto", false)
+                  cacheDir.listFiles()?.forEach { if (it.name.startsWith("clip_")) it.delete() }
+
+                  createChannel()
+                  ServiceCompat.startForeground(
+                      this, 1, buildNotification(),
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                  )
+                  running = true
+                  startedAt = System.currentTimeMillis()
+
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "homecam:svc").also { it.acquire() }
+
+                  val f = IntentFilter().apply {
+                      addAction(Intent.ACTION_POWER_CONNECTED)
+                      addAction(Intent.ACTION_POWER_DISCONNECTED)
+                      addAction(Intent.ACTION_BATTERY_LOW)
+                  }
+                  registerReceiver(powerReceiver, f)
+
+                  startCamera(p.getBoolean("front", false))
+                  startPolling()
+                  main.postDelayed(ticker, 1000)
+                  return START_NOT_STICKY
+              }
+
+              // ---------------------------------------------------------------- camera
+
+              private fun startCamera(front: Boolean) {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      try {
+                          val prov = future.get()
+                          provider = prov
+                          val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+
+                          val analysis = ImageAnalysis.Builder()
+                              .setTargetResolution(Size(1280, 720))
+                              .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                              .build()
+                          analysis.setAnalyzer(analyzerExec) { img -> analyze(img) }
+
+                          val recorder = Recorder.Builder()
+                              .setQualitySelector(
+                                  QualitySelector.from(Quality.SD, FallbackStrategy.higherQualityOrLowerThan(Quality.SD))
+                              )
+                              .build()
+                          val video = VideoCapture.withOutput(recorder)
+
+                          prov.unbindAll()
+                          try {
+                              prov.bindToLifecycle(this, selector, analysis, video)
+                              videoCapture = video
+                          } catch (e: Exception) {
+                              prov.unbindAll()
+                              prov.bindToLifecycle(this, selector, analysis)
+                              videoCapture = null
+                              notifyText("ℹ️ এই ফোনে ভিডিও রেকর্ডিং চলে না, শুধু ছবি পাঠানো হবে।")
+                          }
+                          val b = batteryPercent()
+                          val mode = if (armed) "নড়াচড়া হলে নিজে থেকে ছবি ও ভিডিও আসবে" else "আপনি চাইলে তবেই ছবি/ভিডিও আসবে"
+                          notifyText("✅ HomeCam চালু হয়েছে। ব্যাটারি $b%।\n$mode\n/photo ছবি, /video ভিডিও, /status অবস্থা, /arm নিজে থেকে চালু, /disarm বন্ধ")
+                      } catch (e: Exception) {
+                          notifyText("❌ ক্যামেরা চালু করা যায়নি: ${e.message}")
+                          stopSelf()
+                      }
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun analyze(image: ImageProxy) {
+                  try {
+                      val now = System.currentTimeMillis()
+                      if (now - lastProc < 250) return
+                      lastProc = now
+
+                      val plane = image.planes[0]
+                      val buf = plane.buffer
+                      val rs = plane.rowStride
+                      val ps = plane.pixelStride
+                      val w = image.width
+                      val h = image.height
+
+                      val cur = ByteArray(GRID_W * GRID_H)
+                      for (y in 0 until GRID_H) {
+                          val row = y * h / GRID_H
+                          for (x in 0 until GRID_W) {
+                              cur[y * GRID_W + x] = buf.get(row * rs + (x * w / GRID_W) * ps)
+                          }
+                      }
+
+                      val old = prev
+                      prev = cur
+                      if (old == null) return
+                      if (now - startedAt < 4000) return // camera exposure settling
+
+                      var changed = 0
+                      for (i in cur.indices) {
+                          val d = abs((cur[i].toInt() and 0xFF) - (old[i].toInt() and 0xFF))
+                          if (d > 25) changed++
+                      }
+                      val pct = changed * 100.0 / cur.size
+                      val need = 8.0 - sens * 0.075
+
+                      val takePhoto = wantPhoto
+                      val motion: Boolean
+                      if (pct > need && pct < 70.0) hits++ else hits = 0
+                      motion = hits >= 2
+
+                      if (motion) lastMotion = now
+
+                      val alert = motion && armed && now - lastAlert > 20000
+                      if (alert || takePhoto) {
+                          wantPhoto = false
+                          val jpeg = toJpeg(image)
+                          if (alert) lastAlert = now
+                          val label = stamp()
+                          if (jpeg != null) {
+                              io.execute {
+                                  tg.sendPhoto(jpeg, if (alert) "🚨 নড়াচড়া ধরা পড়েছে\n$label" else "📷 $label")
+                              }
+                          }
+                          if (alert) main.post { startRecording() }
+                      }
+                  } catch (e: Exception) {
+                      // skip this frame
+                  } finally {
+                      image.close()
+                  }
+              }
+
+              private fun toJpeg(image: ImageProxy): ByteArray? {
+                  return try {
+                      val bmp = image.toBitmap()
+                      val rot = image.imageInfo.rotationDegrees
+                      val out = if (rot != 0) {
+                          val m = Matrix().apply { postRotate(rot.toFloat()) }
+                          Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                      } else bmp
+                      val bos = ByteArrayOutputStream()
+                      out.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+                      bos.toByteArray()
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              // -------------------------------------------------------------- recording
+
+              private fun startRecording() {
+                  val vc = videoCapture ?: return
+                  if (recording != null) return
+                  val file = File(cacheDir, "clip_${System.currentTimeMillis()}.mp4")
+                  val caption = "🎥 " + stamp()
+                  try {
+                      recStart = System.currentTimeMillis()
+                      recording = vc.output
+                          .prepareRecording(this, FileOutputOptions.Builder(file).build())
+                          .start(ContextCompat.getMainExecutor(this)) { ev ->
+                              if (ev is VideoRecordEvent.Finalize) {
+                                  recording = null
+                                  if (!ev.hasError() && file.exists() && file.length() > 0) {
+                                      io.execute {
+                                          tg.sendVideo(file, caption)
+                                          file.delete()
+                                      }
+                                  } else {
+                                      file.delete()
+                                  }
+                              }
+                          }
+                  } catch (e: Exception) {
+                      recording = null
+                  }
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      val r = recording
+                      if (r != null) {
+                          val now = System.currentTimeMillis()
+                          val quiet = now - lastMotion > 10000 && now > forceRecordUntil
+                          val tooLong = now - recStart > 45000
+                          if (quiet || tooLong) {
+                              r.stop()
+                          }
+                      }
+                      if (running) main.postDelayed(this, 1000)
+                  }
+              }
+
+              // --------------------------------------------------------------- telegram
+
+              private fun startPolling() {
+                  poller = Thread {
+                      var offset = 0L
+                      tg.getUpdates(-1, 0)?.let { arr ->
+                          if (arr.length() > 0) offset = arr.getJSONObject(arr.length() - 1).getLong("update_id") + 1
+                      }
+                      while (running) {
+                          val ups = tg.getUpdates(offset, 25)
+                          if (ups == null) {
+                              try { Thread.sleep(5000) } catch (e: InterruptedException) { return@Thread }
+                              continue
+                          }
+                          for (i in 0 until ups.length()) {
+                              val u = ups.getJSONObject(i)
+                              offset = u.getLong("update_id") + 1
+                              val msg = u.optJSONObject("message") ?: continue
+                              val from = msg.getJSONObject("chat").getLong("id").toString()
+                              if (from != tg.chat) continue // ignore strangers
+                              handleCommand((msg.optString("text", "")).trim().lowercase(Locale.ROOT))
+                          }
+                      }
+                  }.also { it.isDaemon = true; it.start() }
+              }
+
+              private fun handleCommand(cmd: String) {
+                  when {
+                      cmd.startsWith("/photo") -> wantPhoto = true
+                      cmd.startsWith("/video") -> {
+                          if (videoCapture == null) {
+                              notifyText("এই ফোনে ভিডিও রেকর্ডিং চলে না।")
+                          } else {
+                              forceRecordUntil = System.currentTimeMillis() + 15000
+                              main.post { startRecording() }
+                          }
+                      }
+                      cmd.startsWith("/disarm") -> { armed = false; notifyText("🔕 নিজে থেকে ছবি/ভিডিও বন্ধ। এখন শুধু /photo ও /video দিলে আসবে।") }
+                      cmd.startsWith("/arm") -> { armed = true; notifyText("🔔 এখন থেকে নড়াচড়া হলে নিজে থেকে ছবি ও ভিডিও আসবে।") }
+                      cmd.startsWith("/status") -> {
+                          val charging = isCharging()
+                          notifyText(
+                              "📊 অবস্থা\nব্যাটারি: ${batteryPercent()}% (${if (charging) "চার্জ হচ্ছে" else "বিদ্যুৎ নেই"})\n" +
+                                  "নিজে থেকে ছবি/ভিডিও: ${if (armed) "চালু" else "বন্ধ"}\nসময়: ${stamp()}"
+                          )
+                      }
+                      cmd.startsWith("/start") || cmd.startsWith("/help") ->
+                          notifyText("/photo ছবি\n/video ১৫ সেকেন্ডের ভিডিও\n/status অবস্থা\n/arm নড়াচড়ায় নিজে থেকে পাঠানো চালু\n/disarm বন্ধ")
+                  }
+              }
+
+              private fun notifyText(t: String) {
+                  io.execute { tg.sendText(t) }
+              }
+
+              // ---------------------------------------------------------------- helpers
+
+              private fun stamp(): String =
+                  SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+
+              private fun batteryPercent(): Int {
+                  val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                  return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+              }
+
+              private fun isCharging(): Boolean {
+                  val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val s = i?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+                  return s != 0
+              }
+
+              private fun createChannel() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "HomeCam", NotificationManager.IMPORTANCE_LOW)
+                  )
+              }
+
+              private fun buildNotification(): Notification {
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val stop = PendingIntent.getService(
+                      this, 1, Intent(this, CameraService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return Notification.Builder(this, CHANNEL)
+                      .setContentTitle("HomeCam চালু আছে")
+                      .setContentText("নড়াচড়া পাহারা দিচ্ছে")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .addAction(Notification.Action.Builder(null, "বন্ধ করো", stop).build())
+                      .build()
+              }
+
+              override fun onDestroy() {
+                  val wasRunning = running
+                  running = false
+                  main.removeCallbacks(ticker)
+                  try { recording?.stop() } catch (e: Exception) {}
+                  try { provider?.unbindAll() } catch (e: Exception) {}
+                  try { unregisterReceiver(powerReceiver) } catch (e: Exception) {}
+                  try { wakeLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) {}
+                  analyzerExec.shutdown()
+                  if (wasRunning) io.execute { tg.sendText("⏹ HomeCam বন্ধ হয়েছে।") }
+                  io.shutdown()
+                  super.onDestroy()
+              }
+          }
+          HOMECAM_EOF
+          mkdir -p app/src/main/java/bd/homecam
+          cat > app/src/main/java/bd/homecam/MainActivity.kt <<'HOMECAM_EOF'
+          package bd.homecam
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var token: EditText
+              private lateinit var chatView: TextView
+              private lateinit var status: TextView
+              private lateinit var startBtn: Button
+              private lateinit var stopBtn: Button
+
+              private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String, size: Float = 15f): TextView =
+                  TextView(this).apply {
+                      this.text = text
+                      textSize = size
+                      setPadding(0, dp(8), 0, dp(4))
+                  }
+
+              private fun button(text: String, onClick: () -> Unit): Button =
+                  Button(this).apply {
+                      this.text = text
+                      isAllCaps = false
+                      setOnClickListener { onClick() }
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(24), dp(18), dp(24))
+                  }
+                  val scroll = ScrollView(this).apply { addView(root) }
+                  setContentView(scroll)
+
+                  root.addView(label("HomeCam", 26f))
+                  root.addView(label(
+                      "প্রথমবার সেটআপ:\n" +
+                          "১. টেলিগ্রামে @BotFather এ গিয়ে /newbot দিয়ে নিজের বট বানান। সে একটা Token দেবে।\n" +
+                          "২. নিজের বটে গিয়ে একবার /start লিখুন।\n" +
+                          "৩. নিচে Token বসিয়ে \"আমার Chat ID ধরো\" চাপুন।\n" +
+                          "৪. ব্যাটারি অপ্টিমাইজেশন বন্ধ করে \"চালু করো\" চাপুন।"
+                  ))
+
+                  token = EditText(this).apply {
+                      hint = "Bot Token"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(prefs.getString("token", ""))
+                  }
+                  root.addView(token)
+
+                  chatView = label("")
+                  root.addView(chatView)
+
+                  root.addView(button("আমার Chat ID ধরো") { detectChat() })
+
+                  val sensLabel = label("নড়াচড়ার সংবেদনশীলতা: ${prefs.getInt("sens", 60)}")
+                  root.addView(sensLabel)
+                  val seek = SeekBar(this).apply {
+                      max = 99
+                      progress = prefs.getInt("sens", 60) - 1
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar, p: Int, u: Boolean) {
+                              sensLabel.text = "নড়াচড়ার সংবেদনশীলতা: ${p + 1}"
+                              prefs.edit().putInt("sens", p + 1).apply()
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar) {}
+                          override fun onStopTrackingTouch(s: SeekBar) {}
+                      })
+                  }
+                  root.addView(seek)
+
+                  val front = Switch(this).apply {
+                      text = "সামনের ক্যামেরা ব্যবহার করো"
+                      isChecked = prefs.getBoolean("front", false)
+                      setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("front", c).apply() }
+                  }
+                  root.addView(front)
+
+                  val auto = Switch(this).apply {
+                      text = "নড়াচড়া হলে নিজে থেকে ছবি/ভিডিও পাঠাও (বন্ধ থাকলে শুধু আপনি চাইলে)"
+                      isChecked = prefs.getBoolean("auto", false)
+                      setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("auto", c).apply() }
+                  }
+                  root.addView(auto)
+
+                  root.addView(button("ব্যাটারি অপ্টিমাইজেশন বন্ধ করো") { ignoreBattery() })
+
+                  status = label("")
+                  status.gravity = Gravity.START
+                  root.addView(status)
+
+                  startBtn = button("চালু করো") { start() }
+                  stopBtn = button("বন্ধ করো") {
+                      startService(Intent(this, CameraService::class.java).setAction(CameraService.ACTION_STOP))
+                      status.postDelayed({ refresh() }, 600)
+                  }
+                  root.addView(startBtn)
+                  root.addView(stopBtn)
+                  root.addView(label(
+                      "ছবি ও ভিডিও ফোনে জমা থাকে না, পাঠানোর পরই মুছে যায়, তাই স্টোরেজ ভরবে না। টেলিগ্রামে /photo বা /video লিখলে তবেই আসবে (নিজে থেকে পাঠানো চালু না থাকলে)। " +
+                          "বিদ্যুৎ গেলে বা এলে আপনি মেসেজ পাবেন। ফোন রিস্টার্ট হলে অ্যাপ খুলে আবার \"চালু করো\" চাপতে হবে।",
+                      13f
+                  ))
+                  refresh()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val chat = prefs.getString("chat", "") ?: ""
+                  chatView.text = if (chat.isEmpty()) "Chat ID: এখনো ধরা হয়নি" else "Chat ID: $chat ✔"
+                  val run = CameraService.running
+                  status.text = if (run) "অবস্থা: চালু আছে, পাহারা দিচ্ছে" else "অবস্থা: বন্ধ"
+                  startBtn.visibility = if (run) View.GONE else View.VISIBLE
+                  stopBtn.visibility = if (run) View.VISIBLE else View.GONE
+              }
+
+              private fun detectChat() {
+                  val t = token.text.toString().trim()
+                  if (t.isEmpty()) {
+                      Toast.makeText(this, "আগে Token বসান", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  prefs.edit().putString("token", t).apply()
+                  Thread {
+                      val tg = Telegram(t, "")
+                      val id = tg.latestChatId()
+                      runOnUiThread {
+                          if (id == null) {
+                              Toast.makeText(
+                                  this,
+                                  "Chat ID পাওয়া যায়নি। Token ঠিক আছে কিনা দেখুন এবং বটে /start লিখেছেন কিনা দেখুন।",
+                                  Toast.LENGTH_LONG
+                              ).show()
+                          } else {
+                              prefs.edit().putString("chat", id).apply()
+                              refresh()
+                              Thread { Telegram(t, id).sendText("✅ HomeCam আপনার টেলিগ্রামের সাথে যুক্ত হয়েছে।") }.start()
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun ignoreBattery() {
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                      Toast.makeText(this, "আগে থেকেই বন্ধ করা আছে", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  try {
+                      startActivity(
+                          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                              .setData(Uri.parse("package:$packageName"))
+                      )
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+              }
+
+              private fun start() {
+                  val t = token.text.toString().trim()
+                  if (t.isNotEmpty()) prefs.edit().putString("token", t).apply()
+                  if ((prefs.getString("token", "") ?: "").isEmpty() || (prefs.getString("chat", "") ?: "").isEmpty()) {
+                      Toast.makeText(this, "আগে Token দিন এবং Chat ID ধরুন", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val need = ArrayList<String>()
+                  if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+                      need.add(Manifest.permission.CAMERA)
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.isNotEmpty()) {
+                      requestPermissions(need.toTypedArray(), 7)
+                      return
+                  }
+                  launch()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, res)
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) launch()
+                  else Toast.makeText(this, "ক্যামেরার অনুমতি ছাড়া চলবে না", Toast.LENGTH_LONG).show()
+              }
+
+              private fun launch() {
+                  startForegroundService(Intent(this, CameraService::class.java))
+                  status.postDelayed({ refresh() }, 800)
+              }
+          }
+          HOMECAM_EOF
+          mkdir -p app/src/main/java/bd/homecam
+          cat > app/src/main/java/bd/homecam/Telegram.kt <<'HOMECAM_EOF'
+          package bd.homecam
+
+          import okhttp3.FormBody
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.MultipartBody
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody
+          import okhttp3.RequestBody.Companion.asRequestBody
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.util.concurrent.TimeUnit
+
+          class Telegram(private val token: String, val chat: String) {
+
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(15, TimeUnit.SECONDS)
+                  .readTimeout(60, TimeUnit.SECONDS)
+                  .writeTimeout(60, TimeUnit.SECONDS)
+                  .build()
+
+              private fun url(method: String) = "https://api.telegram.org/bot$token/$method"
+
+              private fun post(method: String, body: RequestBody): String? {
+                  for (attempt in 1..3) {
+                      try {
+                          client.newCall(Request.Builder().url(url(method)).post(body).build()).execute().use { r ->
+                              if (r.isSuccessful) return r.body?.string() ?: ""
+                          }
+                      } catch (e: Exception) {
+                          // try again
+                      }
+                      try {
+                          Thread.sleep(3000)
+                      } catch (e: InterruptedException) {
+                          return null
+                      }
+                  }
+                  return null
+              }
+
+              fun sendText(text: String) {
+                  val body = FormBody.Builder().add("chat_id", chat).add("text", text).build()
+                  post("sendMessage", body)
+              }
+
+              fun sendPhoto(bytes: ByteArray, caption: String) {
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("caption", caption)
+                      .addFormDataPart("photo", "photo.jpg", bytes.toRequestBody("image/jpeg".toMediaType()))
+                      .build()
+                  post("sendPhoto", body)
+              }
+
+              fun sendVideo(file: File, caption: String) {
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("caption", caption)
+                      .addFormDataPart("supports_streaming", "true")
+                      .addFormDataPart("video", file.name, file.asRequestBody("video/mp4".toMediaType()))
+                      .build()
+                  post("sendVideo", body)
+              }
+
+              /** Long-polls for new messages. Returns null when the network call failed. */
+              fun getUpdates(offset: Long, timeoutSec: Int): JSONArray? {
+                  return try {
+                      val u = url("getUpdates") + "?offset=$offset&timeout=$timeoutSec"
+                      client.newCall(Request.Builder().url(u).build()).execute().use { r ->
+                          if (!r.isSuccessful) return null
+                          JSONObject(r.body?.string() ?: return null).optJSONArray("result")
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** Chat id of the latest person who messaged this bot (used for first-time setup). */
+              fun latestChatId(): String? {
+                  val ups = getUpdates(0, 0) ?: return null
+                  var found: String? = null
+                  for (i in 0 until ups.length()) {
+                      val msg = ups.getJSONObject(i).optJSONObject("message") ?: continue
+                      found = msg.getJSONObject("chat").getLong("id").toString()
+                  }
+                  return found
+              }
+          }
+          HOMECAM_EOF
+          cat > build.gradle.kts <<'HOMECAM_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          HOMECAM_EOF
+          cat > gradle.properties <<'HOMECAM_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          HOMECAM_EOF
+          cat > settings.gradle.kts <<'HOMECAM_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "HomeCamBD"
+          include(":app")
+          HOMECAM_EOF
+      - name: Build APK
+        run: |
+          cd $RUNNER_TEMP/proj
+          gradle assembleDebug --no-daemon
+          mkdir -p $GITHUB_WORKSPACE/apk
+          cp app/build/outputs/apk/debug/app-debug.apk $GITHUB_WORKSPACE/apk/HomeCam.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeCam-APK
+          path: apk/HomeCam.apk
